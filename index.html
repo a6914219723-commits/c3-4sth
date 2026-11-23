@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>四色墨水屏 · C3 蓝牙传图</title>
+  <style>
+    :root{color-scheme:light;--ink:#25251f;--muted:#77776e;--paper:#f6f4ee;--line:#dfddd4;--accent:#b4422f}
+    *{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Microsoft YaHei",sans-serif}
+    main{width:min(760px,100%);margin:0 auto;padding:24px 16px 40px}h1{font-size:23px;margin:0 0 4px}p{margin:4px 0;color:var(--muted)}
+    .card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px;margin-top:16px;box-shadow:0 4px 16px #241c0b0a}
+    .pick{display:block;padding:13px;border:1px dashed #bbb8ae;border-radius:10px;background:#faf9f5;width:100%}
+    canvas{display:block;width:100%;height:auto;aspect-ratio:768/552;background:#fff;border:1px solid var(--line);border-radius:8px;margin-top:12px}
+    .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px}.row label{font-size:14px;color:var(--muted)}
+    select,button{font:inherit;border-radius:9px;padding:10px 12px;border:1px solid var(--line);background:white;color:var(--ink)}
+    button{cursor:pointer;font-weight:650}.primary{background:var(--accent);border-color:var(--accent);color:white;flex:1}.primary:disabled,button:disabled{opacity:.45;cursor:default}
+    .status{padding:11px 12px;border-radius:9px;background:#f3f1eb;color:#555348;min-height:44px;font-size:14px;margin-top:12px;overflow-wrap:anywhere}
+    .swatches{display:grid;grid-template-columns:repeat(16,1fr);gap:3px;margin-top:10px}.swatch{height:15px;border-radius:3px;border:1px solid #0001}
+    .adjustments{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:14px}.adjustment{display:grid;grid-template-columns:1fr auto;gap:4px 8px;align-items:center;font-size:14px;color:var(--muted)}
+    .adjustment input{grid-column:1/3;width:100%;accent-color:var(--accent)}.adjustment output{color:var(--ink);font-variant-numeric:tabular-nums}
+    .crop-panel{margin-top:12px}.crop-panel[hidden]{display:none}.crop-canvas{display:block;aspect-ratio:auto;width:auto;max-width:100%;height:auto;max-height:500px;touch-action:none;cursor:crosshair;background:#e9e7df}
+    .small{font-size:12px;color:var(--muted)}.busy{color:#9a3d2d}
+    @media(max-width:500px){main{padding:18px 12px 28px}.card{padding:13px}.swatches{grid-template-columns:repeat(12,1fr)}.adjustments{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+<main>
+  <h1>四色墨水屏 · 蓝牙传图</h1>
+  <p>图片在浏览器本地处理，通过 BLE 发给 ESP32-C3；不使用 Wi-Fi。</p>
+  <section class="card">
+    <div class="row">
+      <button id="connect">连接 FourColor-C3 蓝牙</button>
+      <span class="small" id="connection">未连接</span>
+    </div>
+    <input class="pick" id="file" type="file" accept="image/*" style="margin-top:12px">
+    <div class="row">
+      <label for="fit">画面适配</label>
+      <select id="fit"><option value="cover">按屏幕比例裁切并铺满</option><option value="contain">完整显示并保留留白</option></select>
+      <button id="rotate">逆时针旋转90° <span id="rotationLabel">(当前0°)</span></button>
+      <button id="makeChart">生成48色色卡</button>
+    </div>
+    <div id="cropPanel" class="crop-panel" hidden>
+      <p class="small">取景比例锁定为 768:552。拖动框内移动；拖动角点可缩放；从框外拖动可重新框选。</p>
+      <canvas id="cropEditor" class="crop-canvas" aria-label="屏幕比例裁切取景框"></canvas>
+    </div>
+    <div class="adjustments" aria-label="图像调整">
+      <label class="adjustment" for="brightness"><span>亮度</span><output id="brightnessValue">0</output><input id="brightness" type="range" min="-50" max="50" value="0"></label>
+      <label class="adjustment" for="contrast"><span>对比度</span><output id="contrastValue">100%</output><input id="contrast" type="range" min="50" max="150" value="100"></label>
+      <label class="adjustment" for="saturation"><span>饱和度</span><output id="saturationValue">100%</output><input id="saturation" type="range" min="0" max="150" value="100"></label>
+    </div>
+    <p class="small">调节滑块或适配方式后，点击“手动更新预览”应用；旋转会立即更新当前图片或色卡。</p>
+    <div class="row"><button id="convert">手动更新预览</button></div>
+    <canvas id="preview" width="768" height="552" aria-label="墨水屏预览"></canvas>
+    <div class="row"><button class="primary" id="send" disabled>通过蓝牙传图并刷新</button></div>
+    <div class="status" id="status">请先连接设备，再选择图片。</div>
+  </section>
+  <section class="card">
+    <strong>48 级颜色目标</strong>
+    <p class="small">灰、黄、红各 16 级。色卡按行分组、每行 1–16 号；误差扩散量化，避免固定周期网格。</p>
+    <div class="swatches" id="swatches"></div>
+    <p class="small">预览采用低饱和度的屏幕反射色近似值；实际颜色因屏幕批次和光线而异，请传色卡后在屏上校准。</p>
+  </section>
+</main>
+<script>
+"use strict";
+const W=768,H=552,N=W*H;
+const UUID_SERVICE="0000fff0-0000-1000-8000-00805f9b34fb";
+const UUID_CONTROL="0000fff1-0000-1000-8000-00805f9b34fb";
+const UUID_DATA="0000fff2-0000-1000-8000-00805f9b34fb";
+const UUID_STATUS="0000fff3-0000-1000-8000-00805f9b34fb";
+const fileEl=document.getElementById("file"),fitEl=document.getElementById("fit");
+const cropPanel=document.getElementById("cropPanel"),cropCanvas=document.getElementById("cropEditor"),cropCtx=cropCanvas.getContext("2d");
+const brightnessEl=document.getElementById("brightness"),contrastEl=document.getElementById("contrast"),saturationEl=document.getElementById("saturation");
+const rotationLabel=document.getElementById("rotationLabel");
+const canvas=document.getElementById("preview"),ctx=canvas.getContext("2d",{willReadFrequently:true});
+const statusEl=document.getElementById("status"),sendBtn=document.getElementById("send");
+const connectionEl=document.getElementById("connection"),connectBtn=document.getElementById("connect");
+const GAMMA=1.75;
+/* Native code order: black, white, yellow, red. */
+/* Approximate reflective colors; tune these four values against the physical panel. */
+const RGB_CALIBRATION=[[42,40,36],[236,232,216],[218,190,130],[183,96,80]];
+const GAMMA_LUT=new Float32Array(256);
+for(let i=0;i<256;i++)GAMMA_LUT[i]=255*Math.pow(i/255,GAMMA);
+const nativeLin=RGB_CALIBRATION.map(rgb=>rgb.map(v=>GAMMA_LUT[v]));
+const COLOR_48_LUT=[];
+for(const family of [{low:0,high:1,name:"灰"},{low:0,high:2,name:"黄"},{low:0,high:3,name:"红"}]){
+  for(let level=0;level<16;level++){
+    const t=level/15,a=nativeLin[family.low],b=nativeLin[family.high];
+    COLOR_48_LUT.push({rgb:[0,1,2].map(c=>a[c]*(1-t)+b[c]*t),low:family.low,high:family.high,t,name:family.name,level});
+  }
+}
+let packedFrame=null,sourceBitmap=null,sourceKind="image",frameKind="图片",rotationQuarterTurns=0,previewDirty=false,renderRevision=0,cropRect=null,cropGesture=null,bleDevice=null,controlChar=null,dataChar=null,statusChar=null,maxChunk=18;
+const workCanvas=document.createElement("canvas");workCanvas.width=W;workCanvas.height=H;
+const workCtx=workCanvas.getContext("2d",{willReadFrequently:true});
+
+function setStatus(message,busy=false){statusEl.textContent=message;statusEl.className="status"+(busy?" busy":"");}
+function markPreviewDirty(){
+  if(!sourceBitmap)return;
+  renderRevision++;
+  previewDirty=true;sendBtn.disabled=true;setStatus("预览设置已更改；点击“手动更新预览”后才能发送。");
+}
+function drawSwatches(){
+  const box=document.getElementById("swatches");
+  for(const entry of COLOR_48_LUT){
+    const rgb=entry.rgb.map(v=>Math.max(0,Math.min(255,Math.round(255*Math.pow(v/255,1/GAMMA)))));
+    const el=document.createElement("span");el.className="swatch";el.title=entry.name+" "+(entry.level+1)+"/16";
+    el.style.backgroundColor=`rgb(${rgb[0]} ${rgb[1]} ${rgb[2]})`;box.appendChild(el);
+  }
+}
+function fitImage(bitmap){
+  const paper=RGB_CALIBRATION[1];workCtx.fillStyle=`rgb(${paper[0]} ${paper[1]} ${paper[2]})`;workCtx.fillRect(0,0,W,H);
+  const {width:ow,height:oh}=orientedSize(bitmap),cover=fitEl.value==="cover";
+  const crop=cover?(cropRect||defaultCropRect(bitmap)):{x:0,y:0,w:ow,h:oh};
+  const scale=cover?W/crop.w:Math.min(W/ow,H/oh);
+  const dx=cover?0:(W-ow*scale)/2,dy=cover?0:(H-oh*scale)/2;
+  workCtx.save();workCtx.translate(dx,dy);workCtx.scale(scale,scale);workCtx.translate(-crop.x,-crop.y);
+  drawOrientedBitmap(workCtx,bitmap,rotationQuarterTurns,ow,oh);workCtx.restore();
+  return workCtx.getImageData(0,0,W,H);
+}
+function applyImageAdjustments(imageData){
+  const px=imageData.data,brightness=Number(brightnessEl.value)*2.55;
+  const contrast=Number(contrastEl.value)/100,saturation=Number(saturationEl.value)/100;
+  for(let i=0;i<px.length;i+=4){
+    const luma=.2126*px[i]+.7152*px[i+1]+.0722*px[i+2];
+    for(let c=0;c<3;c++){
+      const mixed=luma+(px[i+c]-luma)*saturation;
+      px[i+c]=Math.max(0,Math.min(255,(mixed-128)*contrast+128+brightness));
+    }
+  }
+  return imageData;
+}
+function updateAdjustmentLabels(){
+  document.getElementById("brightnessValue").textContent=brightnessEl.value;
+  document.getElementById("contrastValue").textContent=contrastEl.value+"%";
+  document.getElementById("saturationValue").textContent=saturationEl.value+"%";
+}
+function orientedSize(bitmap,turns=rotationQuarterTurns){
+  return turns%2?{width:bitmap.height,height:bitmap.width}:{width:bitmap.width,height:bitmap.height};
+}
+function defaultCropRect(bitmap){
+  const {width,height}=orientedSize(bitmap),aspect=W/H;
+  const cropW=Math.min(width,height*aspect),cropH=cropW/aspect;
+  return {x:(width-cropW)/2,y:(height-cropH)/2,w:cropW,h:cropH};
+}
+function drawOrientedBitmap(target,bitmap,turns,orientedW,orientedH){
+  if(turns===1){target.translate(0,orientedH);target.rotate(-Math.PI/2);}
+  else if(turns===2){target.translate(orientedW,orientedH);target.rotate(Math.PI);}
+  else if(turns===3){target.translate(orientedW,0);target.rotate(Math.PI/2);}
+  target.drawImage(bitmap,0,0);
+}
+function updateCropPanel(){
+  cropPanel.hidden=!sourceBitmap||fitEl.value!=="cover";
+  if(!cropPanel.hidden)renderCropEditor();
+}
+function renderCropEditor(){
+  if(!sourceBitmap||cropPanel.hidden)return;
+  const {width:ow,height:oh}=orientedSize(sourceBitmap);
+  if(!cropRect)cropRect=defaultCropRect(sourceBitmap);
+  const previewScale=Math.min(1,760/ow,500/oh);
+  cropCanvas.width=Math.max(1,Math.round(ow*previewScale));cropCanvas.height=Math.max(1,Math.round(oh*previewScale));
+  cropCtx.clearRect(0,0,cropCanvas.width,cropCanvas.height);
+  cropCtx.save();cropCtx.scale(cropCanvas.width/ow,cropCanvas.height/oh);drawOrientedBitmap(cropCtx,sourceBitmap,rotationQuarterTurns,ow,oh);cropCtx.restore();
+  const sx=cropCanvas.width/ow,sy=cropCanvas.height/oh,x=cropRect.x*sx,y=cropRect.y*sy,w=cropRect.w*sx,h=cropRect.h*sy;
+  cropCtx.fillStyle="rgba(0,0,0,.55)";
+  cropCtx.fillRect(0,0,cropCanvas.width,y);cropCtx.fillRect(0,y+h,cropCanvas.width,cropCanvas.height-y-h);
+  cropCtx.fillRect(0,y,x,h);cropCtx.fillRect(x+w,y,cropCanvas.width-x-w,h);
+  cropCtx.strokeStyle="#fff";cropCtx.lineWidth=2;cropCtx.strokeRect(x+1,y+1,w-2,h-2);
+  cropCtx.strokeStyle="rgba(255,255,255,.58)";cropCtx.lineWidth=1;
+  cropCtx.beginPath();cropCtx.moveTo(x+w/3,y);cropCtx.lineTo(x+w/3,y+h);cropCtx.moveTo(x+2*w/3,y);cropCtx.lineTo(x+2*w/3,y+h);
+  cropCtx.moveTo(x,y+h/3);cropCtx.lineTo(x+w,y+h/3);cropCtx.moveTo(x,y+2*h/3);cropCtx.lineTo(x+w,y+2*h/3);cropCtx.stroke();
+  cropCtx.fillStyle="#fff";cropCtx.strokeStyle="#514f48";cropCtx.lineWidth=1;
+  for(const [hx,hy] of [[x,y],[x+w,y],[x,y+h],[x+w,y+h]]){cropCtx.beginPath();cropCtx.arc(hx,hy,6,0,Math.PI*2);cropCtx.fill();cropCtx.stroke();}
+}
+function cropPoint(event){
+  const bounds=cropCanvas.getBoundingClientRect(),{width,height}=orientedSize(sourceBitmap);
+  return {x:(event.clientX-bounds.left)*width/bounds.width,y:(event.clientY-bounds.top)*height/bounds.height};
+}
+function startCropGesture(event){
+  if(!sourceBitmap||fitEl.value!=="cover")return;
+  const p=cropPoint(event),r=cropRect||defaultCropRect(sourceBitmap);
+  const inside=p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h;
+  const bounds=cropCanvas.getBoundingClientRect(),{width:ow,height:oh}=orientedSize(sourceBitmap),tx=14*ow/bounds.width,ty=14*oh/bounds.height;
+  const handles=[{x:r.x,y:r.y,sx:-1,sy:-1},{x:r.x+r.w,y:r.y,sx:1,sy:-1},{x:r.x,y:r.y+r.h,sx:-1,sy:1},{x:r.x+r.w,y:r.y+r.h,sx:1,sy:1}];
+  const handle=handles.find(h=>Math.abs(p.x-h.x)<=tx&&Math.abs(p.y-h.y)<=ty);
+  const anchor=handle?{x:handle.sx<0?r.x+r.w:r.x,y:handle.sy<0?r.y+r.h:r.y}:null;
+  cropGesture={mode:handle?"resize":inside?"move":"draw",handle,anchor,start:p,initial:{...r},offset:{x:p.x-r.x,y:p.y-r.y},changed:false};
+  cropCanvas.setPointerCapture(event.pointerId);event.preventDefault();
+}
+function moveCropGesture(event){
+  if(!cropGesture||!sourceBitmap)return;
+  const p=cropPoint(event),{width:ow,height:oh}=orientedSize(sourceBitmap),aspect=W/H;
+  if(cropGesture.mode==="move"){
+    cropRect={...cropGesture.initial,x:Math.max(0,Math.min(ow-cropGesture.initial.w,p.x-cropGesture.offset.x)),y:Math.max(0,Math.min(oh-cropGesture.initial.h,p.y-cropGesture.offset.y))};
+  }else if(cropGesture.mode==="resize"){
+    const dx=Math.abs(p.x-cropGesture.anchor.x),dy=Math.abs(p.y-cropGesture.anchor.y);
+    let w=dx,h=dy;if(w/h>aspect)w=h*aspect;else h=w/aspect;
+    const maxW=cropGesture.handle.sx>0?ow-cropGesture.anchor.x:cropGesture.anchor.x;
+    const maxH=cropGesture.handle.sy>0?oh-cropGesture.anchor.y:cropGesture.anchor.y;
+    w=Math.max(1,Math.min(w,maxW,maxH*aspect));h=w/aspect;
+    const x=cropGesture.handle.sx>0?cropGesture.anchor.x:cropGesture.anchor.x-w;
+    const y=cropGesture.handle.sy>0?cropGesture.anchor.y:cropGesture.anchor.y-h;
+    cropRect={x,y,w,h};
+  }else{
+    const dx=p.x-cropGesture.start.x,dy=p.y-cropGesture.start.y;
+    const bounds=cropCanvas.getBoundingClientRect();
+    if(Math.abs(dx)*bounds.width/ow<4||Math.abs(dy)*bounds.height/oh<4)return;
+    let w=Math.abs(dx),h=Math.abs(dy);
+    if(w/h>aspect)w=h*aspect;else h=w/aspect;
+    const maxW=Math.min(ow,oh*aspect);w=Math.max(1,Math.min(w,maxW));h=w/aspect;
+    let x=dx>=0?cropGesture.start.x:cropGesture.start.x-w,y=dy>=0?cropGesture.start.y:cropGesture.start.y-h;
+    x=Math.max(0,Math.min(ow-w,x));y=Math.max(0,Math.min(oh-h,y));cropRect={x,y,w,h};
+  }
+  cropGesture.changed=true;renderCropEditor();
+}
+function endCropGesture(){
+  if(!cropGesture)return;
+  const changed=cropGesture.changed;cropGesture=null;
+  if(changed)markPreviewDirty();
+}
+async function quantize48(sourcePixels,regionW=0,regionH=0){
+  const work=new Float32Array(N*3),codes=new Uint8Array(N);
+  for(let i=0,j=0;i<N;i++,j+=4){work[i*3]=GAMMA_LUT[sourcePixels[j]];work[i*3+1]=GAMMA_LUT[sourcePixels[j+1]];work[i*3+2]=GAMMA_LUT[sourcePixels[j+2]];}
+  const kernel=[[1,0,7/16],[-1,1,3/16],[0,1,5/16],[1,1,1/16]],strength=0.9;
+  for(let y=0;y<H;y++){
+    const ltr=(y&1)===0;
+    for(let step=0;step<W;step++){
+      const x=ltr?step:W-1-step,i=y*W+x,o=i*3;
+      const r=Math.max(0,Math.min(255,work[o])),g=Math.max(0,Math.min(255,work[o+1])),b=Math.max(0,Math.min(255,work[o+2]));
+      let best=COLOR_48_LUT[0],bestD=Infinity;
+      for(let k=0;k<COLOR_48_LUT.length;k++){
+        const p=COLOR_48_LUT[k].rgb,dr=r-p[0],dg=g-p[1],db=b-p[2],d=dr*dr+dg*dg+db*db;
+        if(d<bestD){bestD=d;best=COLOR_48_LUT[k];}
+      }
+      const lo=nativeLin[best.low],hi=nativeLin[best.high];
+      const dlo=(r-lo[0])**2+(g-lo[1])**2+(b-lo[2])**2;
+      const dhi=(r-hi[0])**2+(g-hi[1])**2+(b-hi[2])**2;
+      const code=dhi<dlo?best.high:best.low;codes[i]=code;
+      const actual=nativeLin[code],er=(r-actual[0])*strength,eg=(g-actual[1])*strength,eb=(b-actual[2])*strength;
+      for(const [dx,dy,weight] of kernel){
+        const nx=x+(ltr?dx:-dx),ny=y+dy;if(nx<0||nx>=W||ny>=H)continue;
+        if(regionW&&regionH&&(Math.floor(nx/regionW)!==Math.floor(x/regionW)||Math.floor(ny/regionH)!==Math.floor(y/regionH)))continue;
+        const no=(ny*W+nx)*3;work[no]=Math.max(0,Math.min(255,work[no]+er*weight));
+        work[no+1]=Math.max(0,Math.min(255,work[no+1]+eg*weight));work[no+2]=Math.max(0,Math.min(255,work[no+2]+eb*weight));
+      }
+    }
+    if((y&15)===15)await new Promise(requestAnimationFrame);
+  }
+  return codes;
+}
+function showFrame(codes,label){
+  const packed=new Uint8Array(N/4),preview=ctx.createImageData(W,H),pv=preview.data;
+  for(let i=0;i<N;i++){
+    const code=codes[i],o=i*4,color=RGB_CALIBRATION[code];packed[i>>2]|=code<<(6-2*(i&3));
+    pv[o]=color[0];pv[o+1]=color[1];pv[o+2]=color[2];pv[o+3]=255;
+  }
+  packedFrame=packed;frameKind=label;previewDirty=false;ctx.putImageData(preview,0,0);sendBtn.disabled=!dataChar;
+  setStatus(`${label}已生成：${W}×${H}，${packed.length.toLocaleString()} 字节，2bpp。`);
+}
+async function convertImage(){
+  if(!sourceBitmap){setStatus("请先选择图片。");return;}
+  const revision=++renderRevision;
+  sendBtn.disabled=true;setStatus("正在应用屏幕色彩预览和误差扩散…",true);await new Promise(requestAnimationFrame);
+  const src=fitImage(sourceBitmap);
+  if(sourceKind==="image")applyImageAdjustments(src);
+  const isolateChart=sourceKind==="chart"&&rotationQuarterTurns===0;
+  const codes=await quantize48(src.data,isolateChart?48:0,isolateChart?184:0);
+  if(revision!==renderRevision)return;
+  showFrame(codes,sourceKind==="chart"?"48 色测试卡预览":"图片预览");
+}
+async function make48Chart(){
+  if(sourceBitmap)sourceBitmap.close();fileEl.value="";sendBtn.disabled=true;setStatus("正在生成 3 行 × 16 格的 48 色测试卡…",true);await new Promise(requestAnimationFrame);
+  const chart=document.createElement("canvas");chart.width=W;chart.height=H;
+  const chartCtx=chart.getContext("2d"),cellW=48,cellH=184,labelH=22;
+  for(let row=0;row<3;row++)for(let col=0;col<16;col++){
+    const entry=COLOR_48_LUT[row*16+col];
+    const rgb=entry.rgb.map(v=>Math.max(0,Math.min(255,Math.round(255*Math.pow(v/255,1/GAMMA)))));
+    chartCtx.fillStyle=`rgb(${rgb[0]} ${rgb[1]} ${rgb[2]})`;chartCtx.fillRect(col*cellW,row*cellH,cellW,cellH-labelH);
+    const paper=RGB_CALIBRATION[1];chartCtx.fillStyle=`rgb(${paper[0]} ${paper[1]} ${paper[2]})`;chartCtx.fillRect(col*cellW,(row+1)*cellH-labelH,cellW,labelH);
+    const ink=RGB_CALIBRATION[0];chartCtx.fillStyle=`rgb(${ink[0]} ${ink[1]} ${ink[2]})`;chartCtx.font="bold 15px monospace";chartCtx.textAlign="center";chartCtx.textBaseline="middle";
+    chartCtx.fillText(String(col+1).padStart(2,"0"),col*cellW+cellW/2,(row+1)*cellH-labelH/2);
+  }
+  chartCtx.fillStyle=`rgb(${RGB_CALIBRATION[0].join(" ")})`;
+  for(let x=0;x<W;x+=cellW)chartCtx.fillRect(x,0,1,H);
+  for(let y=0;y<H;y+=cellH)chartCtx.fillRect(0,y,W,1);
+  sourceBitmap=await createImageBitmap(chart);sourceKind="chart";cropRect=defaultCropRect(sourceBitmap);updateCropPanel();await convertImage();
+}
+function crc16(data){
+  let crc=0xffff;
+  for(let i=0;i<data.length;i++){crc^=data[i]<<8;for(let bit=0;bit<8;bit++)crc=(crc&0x8000)?((crc<<1)^0x1021)&0xffff:(crc<<1)&0xffff;}
+  return crc;
+}
+async function writeCharacteristic(ch,value){
+  if(typeof ch.writeValueWithResponse==="function")return ch.writeValueWithResponse(value);
+  return ch.writeValue(value);
+}
+async function readDeviceStatus(){
+  const view=await statusChar.readValue();
+  if(view.byteLength<6)throw new Error("设备固件版本过旧；请更新并重新烧录本工程固件后再传图。");
+  return {state:view.getUint8(0),error:view.getUint8(1),chunk:view.getUint16(2,true),nextSeq:view.getUint16(4,true)};
+}
+const errorText={1:"帧头或图片尺寸不正确",2:"设备正在刷新，请稍后再传",3:"分包序号不连续",4:"数据长度不正确",5:"整帧校验失败",6:"屏幕刷新失败，请检查排线和 BUSY",7:"接收超时，请重新连接后再传",8:"传输中蓝牙断开"};
+async function connectBle(){
+  if(!window.isSecureContext||!navigator.bluetooth){setStatus("当前浏览器环境不能使用 Web Bluetooth。请用 Chrome/Edge 通过 localhost 或 HTTPS 打开此页。");return;}
+  connectBtn.disabled=true;
+  try{
+    bleDevice=await navigator.bluetooth.requestDevice({filters:[{namePrefix:"FourColor-C3"}],optionalServices:[UUID_SERVICE]});
+    bleDevice.addEventListener("gattserverdisconnected",()=>{controlChar=dataChar=statusChar=null;connectionEl.textContent="已断开";connectBtn.textContent="连接 FourColor-C3 蓝牙";connectBtn.disabled=false;sendBtn.disabled=true;});
+    const server=await bleDevice.gatt.connect(),service=await server.getPrimaryService(UUID_SERVICE);
+    controlChar=await service.getCharacteristic(UUID_CONTROL);dataChar=await service.getCharacteristic(UUID_DATA);statusChar=await service.getCharacteristic(UUID_STATUS);
+    const s=await readDeviceStatus();maxChunk=Math.max(1,Math.min(244,s.chunk||18));
+    connectionEl.textContent="已连接 · 每包 "+maxChunk+" 字节";connectBtn.textContent="断开蓝牙";connectBtn.disabled=false;
+    sendBtn.disabled=!packedFrame||previewDirty;setStatus("蓝牙已连接。选图或生成 48 色测试卡后即可传输。");
+  }catch(error){bleDevice=null;controlChar=dataChar=statusChar=null;connectBtn.disabled=false;setStatus("蓝牙连接失败："+(error.message||error));}
+}
+async function pollUntilFinished(){
+  for(let i=0;i<360;i++){
+    const s=await readDeviceStatus();
+    if(s.state===3)return s;
+    if(s.state===4)throw new Error(errorText[s.error]||("设备返回错误码 "+s.error));
+    await new Promise(r=>setTimeout(r,750));
+  }
+  throw new Error("等待屏幕刷新超时；请查看设备状态灯或串口日志。");
+}
+async function uploadFrame(){
+  if(previewDirty){setStatus("调整已更改；请先点击“手动更新预览”。");return;}
+  if(!packedFrame||!controlChar||!dataChar||!statusChar){setStatus("先连接 FourColor-C3，再生成图片预览。");return;}
+  sendBtn.disabled=true;
+  try{
+    setStatus("正在开始 BLE 传输…",true);
+    const crc=crc16(packedFrame),header=new Uint8Array(13);
+    header.set([0xA5,0x5A,1,(W>>8)&255,W&255,(H>>8)&255,H&255,
+      (packedFrame.length>>>24)&255,(packedFrame.length>>>16)&255,(packedFrame.length>>>8)&255,packedFrame.length&255,
+      (crc>>8)&255,crc&255]);
+    await writeCharacteristic(controlChar,header);
+    const totalPackets=Math.ceil(packedFrame.length/maxChunk);
+    const noResponse=typeof dataChar.writeValueWithoutResponse==="function";
+    const windowPackets=noResponse?24:16;
+    let ack=0,stalls=0;
+    const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+    while(ack<totalPackets){
+      const end=Math.min(totalPackets,ack+windowPackets);
+      for(let seq=ack;seq<end;seq++){
+        const offset=seq*maxChunk,count=Math.min(maxChunk,packedFrame.length-offset),packet=new Uint8Array(count+2);
+        packet[0]=(seq>>8)&255;packet[1]=seq&255;packet.set(packedFrame.subarray(offset,offset+count),2);
+        if(noResponse)await dataChar.writeValueWithoutResponse(packet);
+        else await writeCharacteristic(dataChar,packet);
+      }
+      if(noResponse)await pause(25);
+      const s=await readDeviceStatus();
+      if(s.state===4)throw new Error(errorText[s.error]||("设备返回错误码 "+s.error));
+      if(s.nextSeq>totalPackets)throw new Error("设备确认序号超出当前图片范围");
+      if(s.nextSeq>ack){ack=s.nextSeq;stalls=0;}
+      else if(++stalls>10)throw new Error("设备没有确认收到数据；请靠近设备后重试");
+      else await pause(Math.min(250,25*stalls));
+      const received=Math.min(ack*maxChunk,packedFrame.length);
+      setStatus(`蓝牙传图中：${Math.floor(received*100/packedFrame.length)}%（${noResponse?"快速无响应分批":"分批确认"}）`,true);
+    }
+    setStatus("图片已完整送达，设备正在校验并刷新屏幕…",true);
+    await pollUntilFinished();setStatus("刷新完成，画面已保留在屏幕上。");
+  }catch(error){
+    let detail=error.message||String(error);
+    if(statusChar){try{const s=await readDeviceStatus();if(s.state===4&&s.error)detail=errorText[s.error]||detail;}catch(_){}}
+    setStatus("传图失败："+detail);
+  }finally{sendBtn.disabled=!dataChar||previewDirty;}
+}
+connectBtn.addEventListener("click",()=>{
+  if(bleDevice&&bleDevice.gatt&&bleDevice.gatt.connected){bleDevice.gatt.disconnect();return;}
+  connectBle();
+});
+fileEl.addEventListener("change",async()=>{
+  const file=fileEl.files&&fileEl.files[0];if(!file)return;
+  try{if(sourceBitmap)sourceBitmap.close();sourceBitmap=await createImageBitmap(file);sourceKind="image";cropRect=defaultCropRect(sourceBitmap);updateCropPanel();previewDirty=true;await convertImage();}
+  catch(error){setStatus("无法读取图片："+(error.message||error));}
+});
+document.getElementById("convert").addEventListener("click",convertImage);
+document.getElementById("makeChart").addEventListener("click",make48Chart);
+fitEl.addEventListener("change",()=>{updateCropPanel();markPreviewDirty();});
+cropCanvas.addEventListener("pointerdown",startCropGesture);
+cropCanvas.addEventListener("pointermove",moveCropGesture);
+cropCanvas.addEventListener("pointerup",endCropGesture);
+cropCanvas.addEventListener("pointercancel",endCropGesture);
+for(const input of [brightnessEl,contrastEl,saturationEl])input.addEventListener("input",()=>{updateAdjustmentLabels();markPreviewDirty();});
+document.getElementById("rotate").addEventListener("click",()=>{
+  rotationQuarterTurns=(rotationQuarterTurns+1)%4;rotationLabel.textContent="(当前逆时针"+(rotationQuarterTurns*90)+"°)";
+  if(sourceBitmap){cropRect=defaultCropRect(sourceBitmap);updateCropPanel();previewDirty=true;convertImage();}
+  else setStatus("方向已设为逆时针 "+(rotationQuarterTurns*90)+"°；选择图片或生成色卡后生效。");
+});
+sendBtn.addEventListener("click",uploadFrame);
+updateAdjustmentLabels();
+drawSwatches();
+if(!window.isSecureContext||!navigator.bluetooth)setStatus("蓝牙页面需在 Chrome/Edge 的 localhost 或 HTTPS 页面打开。");
+</script>
+</body>
+</html>
